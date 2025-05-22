@@ -1,0 +1,18 @@
+[package]
+name = "sky_sheet_player"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+enigo = "0.3.0"
+crossterm = "0.29.0"
+rand = "0.9.1"
+rdev = "0.5.3"
+eframe = "0.31.1"
+egui = "0.31.1"
+rfd = "0.15.3"
+device_query = "3.0.1"
+dirs = "5.0.1"
+enum-iterator = "2.0.0"
