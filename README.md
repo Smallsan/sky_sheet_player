@@ -46,6 +46,12 @@ These hotkeys can be customized in the application and your preferences will be 
 
 The application expects song files in JSON format (usually with .txt extension) with the following structure:
 
+```
+Compatible with songs from here:
+// Download it as JSON
+https://sky-music.github.io/
+```
+
 ```json
 {
   "name": "Song Name",
