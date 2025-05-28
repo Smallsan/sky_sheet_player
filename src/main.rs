@@ -1,11 +1,12 @@
-use device_query::{DeviceQuery, DeviceState, Keycode};
+use device_query::Keycode;
 use eframe::{App, egui};
 use enigo::{
     Direction::{Press, Release},
     Enigo, Key, Keyboard, Settings,
 };
-use hotkey_utils::{HotkeyCapture, format_key_description, is_valid_hotkey};
+use hotkey_utils::{HotkeyCapture, format_key_description};
 use rand::Rng;
+use rdev::{EventType, Key as RdevKey, listen};
 use rfd::FileDialog;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
@@ -50,6 +51,9 @@ struct AppState {
     hotkeys: Hotkeys,
     show_help: bool,
     hotkey_capture: HotkeyCapture, // Track hotkey capture status
+    manual_mode: bool,             // Manual rhythm mode flag
+    manual_index: usize,           // Current note index for manual mode
+    manual_key_down: bool,         // Track if manual advance key is held
 }
 
 // Custom struct to hold hotkey settings
@@ -74,21 +78,97 @@ impl Default for Hotkeys {
 
 pub struct SkySheetApp {
     state: Arc<Mutex<AppState>>,
-    device_state: DeviceState,
-    last_keys: Vec<Keycode>,
     last_hotkey_time: std::time::Instant,
 }
 
 impl Default for SkySheetApp {
     fn default() -> Self {
+        let state = Arc::new(Mutex::new(AppState {
+            speed: 1.0,
+            ..Default::default()
+        }));
+        // Start global hotkey listener thread
+        let state_clone = Arc::clone(&state);
+        std::thread::spawn(move || {
+            if let Err(e) = listen(move |event| {
+                if let EventType::KeyPress(key) = event.event_type {
+                    if let Some(keycode) = rdev_key_to_keycode(key) {
+                        let mut state = state_clone.lock().unwrap();
+                        // Only detect hotkeys if a song is loaded and playback has started at least once
+                        let song_loaded = state.song_path.is_some();
+                        let has_played = state.is_playing || state.progress > 0;
+                        if !song_loaded || !has_played {
+                            return;
+                        }
+                        if state.hotkey_capture == HotkeyCapture::None {
+                            // Manual rhythm mode: listen for ; or '
+                            if state.manual_mode && state.is_playing {
+                                if (keycode == Keycode::Semicolon || keycode == Keycode::Apostrophe)
+                                    && !state.manual_key_down
+                                {
+                                    state.manual_key_down = true;
+                                    let state_arc = Arc::clone(&state_clone);
+                                    std::thread::spawn(move || {
+                                        play_song_manual_tick(state_arc);
+                                    });
+                                    return;
+                                }
+                            }
+                            // Hotkeys
+                            if keycode == state.hotkeys.play_pause {
+                                if state.is_playing {
+                                    state.is_paused = !state.is_paused;
+                                    state.status = if state.is_paused {
+                                        "Paused".to_string()
+                                    } else {
+                                        "Playing...".to_string()
+                                    };
+                                } else if state.song_path.is_some() {
+                                    state.is_playing = true;
+                                    state.status = "Starting playback...".to_string();
+                                    let state_arc = Arc::clone(&state_clone);
+                                    std::thread::spawn(move || {
+                                        play_song_gui(state_arc);
+                                    });
+                                }
+                            } else if keycode == state.hotkeys.stop {
+                                if state.is_playing {
+                                    state.is_playing = false;
+                                    state.is_paused = false;
+                                    state.status = "Stopped".to_string();
+                                }
+                            } else if keycode == state.hotkeys.speed_up {
+                                state.speed += 0.1;
+                                if state.speed > 2.0 {
+                                    state.speed = 2.0;
+                                }
+                                state.status = format!("Speed: {:.1}x", state.speed);
+                            } else if keycode == state.hotkeys.speed_down {
+                                state.speed -= 0.1;
+                                if state.speed < 0.5 {
+                                    state.speed = 0.5;
+                                }
+                                state.status = format!("Speed: {:.1}x", state.speed);
+                            }
+                        }
+                    }
+                } else if let EventType::KeyRelease(key) = event.event_type {
+                    if let Some(keycode) = rdev_key_to_keycode(key) {
+                        let mut state = state_clone.lock().unwrap();
+                        if state.manual_mode
+                            && (keycode == Keycode::Semicolon || keycode == Keycode::Apostrophe)
+                        {
+                            state.manual_key_down = false;
+                        }
+                    }
+                }
+            }) {
+                eprintln!("Global hotkey listener error: {:?}", e);
+            }
+        });
         Self {
-            state: Arc::new(Mutex::new(AppState {
-                speed: 1.0,
-                ..Default::default()
-            })),
-            device_state: DeviceState::new(),
-            last_keys: Vec::new(),
-            last_hotkey_time: std::time::Instant::now(),
+            state,
+            last_hotkey_time: std::time::Instant::now(), // Will be removed below
         }
     }
 }
@@ -105,109 +185,64 @@ impl App for SkySheetApp {
         visuals.widgets.noninteractive.bg_stroke.color = egui::Color32::from_rgb(70, 70, 100);
         ctx.set_visuals(visuals);
 
-        // Check for global hotkeys
-        let keys = self.device_state.get_keys();
+        // Always request repaint so UI updates with global hotkey changes
+        ctx.request_repaint();
+        // Only keep hotkey capture logic (for changing hotkeys) and UI
         let state_clone = Arc::clone(&self.state);
         let mut state = state_clone.lock().unwrap();
-
-        // Check for hotkey capture mode
-        if state.hotkey_capture != HotkeyCapture::None && !keys.is_empty() {
-            // Get first key press that wasn't in the previous frame
-            for key in &keys {
-                if !self.last_keys.contains(key) && is_valid_hotkey(*key) {
-                    // Assign the key to the appropriate hotkey
-                    match state.hotkey_capture {
-                        HotkeyCapture::WaitingForPlayPause => {
-                            state.hotkeys.play_pause = *key;
-                            state.status = format!(
-                                "Play/Pause hotkey set to: {}",
-                                format_key_description(*key)
-                            );
-                        }
-                        HotkeyCapture::WaitingForStop => {
-                            state.hotkeys.stop = *key;
-                            state.status =
-                                format!("Stop hotkey set to: {}", format_key_description(*key));
-                        }
-                        HotkeyCapture::WaitingForSpeedUp => {
-                            state.hotkeys.speed_up = *key;
-                            state.status =
-                                format!("Speed Up hotkey set to: {}", format_key_description(*key));
-                        }
-                        HotkeyCapture::WaitingForSpeedDown => {
-                            state.hotkeys.speed_down = *key;
-                            state.status = format!(
-                                "Speed Down hotkey set to: {}",
-                                format_key_description(*key)
-                            );
-                        }
-                        _ => {}
+        // Hotkey capture (for changing hotkeys) still works when focused
+        if state.hotkey_capture != HotkeyCapture::None {
+            if let Some(key) = ctx.input(|i| {
+                i.events.iter().find_map(move |e| match e {
+                    egui::Event::Key {
+                        key, pressed: true, ..
+                    } => Some(*key),
+                    _ => None,
+                })
+            }) {
+                use egui::Key;
+                let keycode = match key {
+                    Key::Space => Keycode::Space,
+                    Key::Escape => Keycode::Escape,
+                    Key::Equals => Keycode::Equal,
+                    Key::Minus => Keycode::Minus,
+                    Key::Semicolon => Keycode::Semicolon,
+                    Key::Quote => Keycode::Apostrophe,
+                    // Add more as needed
+                    _ => return,
+                };
+                match state.hotkey_capture {
+                    HotkeyCapture::WaitingForPlayPause => {
+                        state.hotkeys.play_pause = keycode;
+                        state.status = format!(
+                            "Play/Pause hotkey set to: {}",
+                            format_key_description(keycode)
+                        );
                     }
-
-                    // Reset capture mode
-                    state.hotkey_capture = HotkeyCapture::None;
-                    break;
+                    HotkeyCapture::WaitingForStop => {
+                        state.hotkeys.stop = keycode;
+                        state.status =
+                            format!("Stop hotkey set to: {}", format_key_description(keycode));
+                    }
+                    HotkeyCapture::WaitingForSpeedUp => {
+                        state.hotkeys.speed_up = keycode;
+                        state.status = format!(
+                            "Speed Up hotkey set to: {}",
+                            format_key_description(keycode)
+                        );
+                    }
+                    HotkeyCapture::WaitingForSpeedDown => {
+                        state.hotkeys.speed_down = keycode;
+                        state.status = format!(
+                            "Speed Down hotkey set to: {}",
+                            format_key_description(keycode)
+                        );
+                    }
+                    _ => {}
                 }
+                state.hotkey_capture = HotkeyCapture::None;
             }
         }
-
-        // Only process global hotkeys if we're not capturing a new hotkey
-        if state.hotkey_capture == HotkeyCapture::None {
-            // Add a cooldown period to prevent accidental double-triggers
-            let now = std::time::Instant::now();
-            let cooldown_period = std::time::Duration::from_millis(200);
-            let can_trigger_hotkey = now.duration_since(self.last_hotkey_time) >= cooldown_period;
-
-            // Only process a key if it's new (wasn't pressed in the last frame)
-            for key in &keys {
-                if !self.last_keys.contains(key) && can_trigger_hotkey {
-                    self.last_hotkey_time = now;
-                    match *key {
-                        k if k == state.hotkeys.play_pause => {
-                            if state.is_playing {
-                                state.is_paused = !state.is_paused;
-                                if state.is_paused {
-                                    state.status = "Paused".to_string();
-                                } else {
-                                    state.status = "Playing...".to_string();
-                                }
-                            } else if state.song_path.is_some() {
-                                // Start playing
-                                state.is_playing = true;
-                                state.status = "Starting playback...".to_string();
-                                let state_arc = Arc::clone(&self.state);
-                                std::thread::spawn(move || {
-                                    play_song_gui(state_arc);
-                                });
-                            }
-                        }
-                        k if k == state.hotkeys.stop => {
-                            if state.is_playing {
-                                state.is_playing = false;
-                                state.is_paused = false;
-                                state.status = "Stopped".to_string();
-                            }
-                        }
-                        k if k == state.hotkeys.speed_up => {
-                            state.speed += 0.1;
-                            if state.speed > 2.0 {
-                                state.speed = 2.0;
-                            }
-                            state.status = format!("Speed: {:.1}x", state.speed);
-                        }
-                        k if k == state.hotkeys.speed_down => {
-                            state.speed -= 0.1;
-                            if state.speed < 0.5 {
-                                state.speed = 0.5;
-                            }
-                            state.status = format!("Speed: {:.1}x", state.speed);
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        self.last_keys = keys;
 
         // Draw the UI with an improved layout and theme
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
@@ -285,8 +320,8 @@ impl App for SkySheetApp {
                 ui.add_space(10.0);
             }
 
-            // File selection
             ui.group(|ui| {
+                // File selection row
                 ui.horizontal(|ui| {
                     if ui.button("📂 Select Song File").clicked() {
                         if let Some(path) =
@@ -294,12 +329,46 @@ impl App for SkySheetApp {
                         {
                             state.song_path = Some(path.display().to_string());
                             state.status = "Song loaded!".to_string();
+                            state.manual_index = 0; // Reset manual index on new song
+                            if state.manual_mode {
+                                state.is_playing = true; // Ensure manual mode is ready after new song
+                            } else {
+                                state.is_playing = false;
+                            }
+                            state.progress = 0;
                         }
                     }
                     if let Some(ref path) = state.song_path {
                         ui.label(format!("Selected: {}", path));
                     } else {
                         ui.label("No file selected");
+                    }
+                });
+                // Manual rhythm mode toggle always left-aligned, in its own row
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            state.song_path.is_some(),
+                            egui::Button::new(if state.manual_mode {
+                                "Manual Rhythm: ON"
+                            } else {
+                                "Manual Rhythm: OFF"
+                            }),
+                        )
+                        .clicked()
+                    {
+                        state.manual_mode = !state.manual_mode;
+                        if state.manual_mode {
+                            state.status =
+                                "Manual rhythm mode enabled! Press ; or ' to advance.".to_string();
+                            state.manual_index = 0;
+                            if state.song_path.is_some() {
+                                state.is_playing = true; // Enable manual tick handler
+                            }
+                        } else {
+                            state.status = "Manual rhythm mode disabled.".to_string();
+                            state.is_playing = false; // Disable manual tick handler
+                        }
                     }
                 });
             });
@@ -316,14 +385,11 @@ impl App for SkySheetApp {
                         let btn_size = egui::Vec2::new(60.0, 40.0);
 
                         if !state.is_playing {
-                            if ui
-                                .add(
-                                    egui::Button::new("▶️ Play")
-                                        .min_size(btn_size)
-                                        .fill(egui::Color32::from_rgb(50, 180, 100)),
-                                )
-                                .clicked()
-                            {
+                            // Disable Play button if manual mode is enabled
+                            let play_btn = egui::Button::new("▶️ Play")
+                                .min_size(btn_size)
+                                .fill(egui::Color32::from_rgb(50, 180, 100));
+                            if ui.add_enabled(!state.manual_mode, play_btn).clicked() {
                                 let state_arc = Arc::clone(&self.state);
                                 state.is_playing = true;
                                 state.status = "Starting playback...".to_string();
@@ -449,10 +515,10 @@ impl App for SkySheetApp {
 
 fn play_song_gui(state_arc: Arc<Mutex<AppState>>) {
     // We'll use this function to safely get a lock and handle errors
-    let mut get_lock = || state_arc.lock().unwrap();
+    let get_lock = || state_arc.lock().unwrap();
 
     // Initial setup - get file path and speed
-    let (path, speed, total_notes) = {
+    let (path, speed, _total_notes) = {
         let mut state = get_lock();
         state.is_playing = true;
         state.status = "Playing...".to_string();
@@ -623,6 +689,69 @@ fn play_song_gui(state_arc: Arc<Mutex<AppState>>) {
     state.is_playing = false;
 }
 
+fn play_song_manual_tick(state_arc: Arc<Mutex<AppState>>) {
+    // Get song path and manual index
+    let (path, manual_index) = {
+        let state = state_arc.lock().unwrap();
+        match (&state.song_path, state.manual_index) {
+            (Some(p), idx) => (p.clone(), idx),
+            _ => return,
+        }
+    };
+
+    // Read file
+    let mut file = match File::open(&path) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    let mut contents = String::new();
+    if file.read_to_string(&mut contents).is_err() {
+        return;
+    }
+    let contents = contents.trim();
+    let song = match serde_json::from_str::<Vec<Song>>(contents) {
+        Ok(songs) if !songs.is_empty() => songs[0].clone(),
+        _ => return,
+    };
+    if manual_index >= song.song_notes.len() {
+        let mut state = state_arc.lock().unwrap();
+        state.status = "Song finished!".to_string();
+        state.is_playing = false;
+        return;
+    }
+    // Find all notes at the next time
+    let next_time = song.song_notes[manual_index].time;
+    let mut notes_to_play = Vec::new();
+    let mut new_index = manual_index;
+    while new_index < song.song_notes.len() && song.song_notes[new_index].time == next_time {
+        notes_to_play.push(song.song_notes[new_index].clone());
+        new_index += 1;
+    }
+    // Play all notes at this time
+    let mut enigo = match Enigo::new(&Settings::default()) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for note in &notes_to_play {
+        if let Some(key) = map_key(&note.key) {
+            let _ = enigo.key(Key::Unicode(key), Press);
+            thread::sleep(Duration::from_millis(40));
+            let _ = enigo.key(Key::Unicode(key), Release);
+        }
+    }
+    // Update progress and index
+    let mut state = state_arc.lock().unwrap();
+    state.progress = new_index;
+    state.manual_index = new_index;
+    state.total = song.song_notes.len();
+    if new_index >= song.song_notes.len() {
+        state.status = "Song finished!".to_string();
+        state.is_playing = false;
+    } else {
+        state.status = format!("Manual: {}/{} notes", new_index, song.song_notes.len());
+    }
+}
+
 fn main() {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([650.0, 550.0]),
@@ -660,4 +789,33 @@ fn map_key(key_str: &str) -> Option<char> {
         }
     }
     None
+}
+
+fn rdev_key_to_keycode(key: RdevKey) -> Option<Keycode> {
+    use device_query::Keycode as DKey;
+    use rdev::Key as RKey;
+    Some(match key {
+        RKey::Space => DKey::Space,
+        RKey::Escape => DKey::Escape,
+        RKey::Equal => DKey::Equal,
+        RKey::Minus => DKey::Minus,
+        RKey::SemiColon => DKey::Semicolon,
+        RKey::Quote => DKey::Apostrophe,
+        RKey::KeyH => DKey::H,
+        RKey::KeyJ => DKey::J,
+        RKey::KeyK => DKey::K,
+        RKey::KeyL => DKey::L,
+        RKey::KeyN => DKey::N,
+        RKey::KeyM => DKey::M,
+        RKey::KeyO => DKey::O,
+        RKey::KeyP => DKey::P,
+        RKey::KeyU => DKey::U,
+        RKey::KeyI => DKey::I,
+        RKey::KeyY => DKey::Y,
+        RKey::Comma => DKey::Comma,
+        RKey::Dot => DKey::Dot,
+        RKey::Slash => DKey::Slash,
+        // Add more as needed
+        _ => return None,
+    })
 }
